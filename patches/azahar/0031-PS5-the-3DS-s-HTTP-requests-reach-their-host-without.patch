@@ -1,0 +1,198 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps5cemu <ps5cemu@localhost>
+Date: Wed, 21 Oct 2026 18:40:57 -0400
+Subject: [PATCH] PS5: the 3DS's HTTP requests reach their host without
+ getaddrinfo
+
+Artic Setup's system update ended with "An error has occurred. Unable
+to update." ("Request failed: -1: Invalid"): httplib finds its host
+with getaddrinfo, which on the console asks a resolver a homebrew title
+does not reach, and finds nothing, even for a numeric address.
+
+The host's address comes from the PS5's resolver
+(sceNetResolverStartNtoa, as the port's own downloads find theirs) and
+is given to httplib with set_hostname_addr_map; TLS and the Host header
+keep the host's name. httplib uses a numeric IPv4 address as it is,
+without getaddrinfo. fcntl's FD_CLOEXEC, which the console refuses on
+its sockets (EACCES), no longer closes the socket, and set_nonblocking
+also sets the console's SO_NBIO, as Artic Base's client does, so a
+connection that gets no answer times out.
+---
+ externals/httplib/httplib.h          | 39 +++++++++++++++++--
+ src/core/hle/service/http/http_c.cpp | 57 ++++++++++++++++++++++++++++
+ 2 files changed, 93 insertions(+), 3 deletions(-)
+
+diff --git a/externals/httplib/httplib.h b/externals/httplib/httplib.h
+index c49e50e..bbc6282 100644
+--- a/externals/httplib/httplib.h
++++ b/externals/httplib/httplib.h
+@@ -2997,12 +2997,36 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
+ 
+   auto service = std::to_string(port);
+ 
++#ifdef __PROSPERO__
++  // PS5: getaddrinfo asks the console's resolver even for a numeric address, and a homebrew title
++  // finds nothing there: an IPv4 address (Azahar's HTTP service gives the PS5 resolver's) is used
++  // as it is. Not freed with freeaddrinfo below
++  struct sockaddr_in numeric_address {};
++  struct addrinfo numeric {};
++  const bool is_numeric =
++      node && inet_pton(AF_INET, node, &numeric_address.sin_addr) == 1;
++  if (is_numeric) {
++    numeric_address.sin_family = AF_INET;
++    numeric_address.sin_port = htons(static_cast<uint16_t>(port));
++    numeric.ai_family = AF_INET;
++    numeric.ai_socktype = SOCK_STREAM;
++    numeric.ai_addr = reinterpret_cast<struct sockaddr *>(&numeric_address);
++    numeric.ai_addrlen = sizeof(numeric_address);
++    result = &numeric;
++  } else
++#endif
+   if (getaddrinfo(node, service.c_str(), &hints, &result)) {
+ #if defined __linux__ && !defined __ANDROID__
+     res_init();
+ #endif
+     return INVALID_SOCKET;
+   }
++  const auto free_result = [&]() {
++#ifdef __PROSPERO__
++    if (is_numeric) { return; }
++#endif
++    freeaddrinfo(result);
++  };
+ 
+   for (auto rp = result; rp; rp = rp->ai_next) {
+     // Create a socket
+@@ -3032,11 +3056,14 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
+ #endif
+     if (sock == INVALID_SOCKET) { continue; }
+ 
+-#ifndef _WIN32
++#if !defined _WIN32 && !defined __PROSPERO__
+     if (fcntl(sock, F_SETFD, FD_CLOEXEC) == -1) {
+       close_socket(sock);
+       continue;
+     }
++#elif defined __PROSPERO__
++    // PS5: fcntl can refuse the console's sockets (EACCES), and the app execs no other program
++    (void)fcntl(sock, F_SETFD, FD_CLOEXEC);
+ #endif
+ 
+     if (tcp_nodelay) {
+@@ -3065,14 +3092,14 @@ socket_t create_socket(const std::string &host, const std::string &ip, int port,
+ 
+     // bind or connect
+     if (bind_or_connect(sock, *rp)) {
+-      freeaddrinfo(result);
++      free_result();
+       return sock;
+     }
+ 
+     close_socket(sock);
+   }
+ 
+-  freeaddrinfo(result);
++  free_result();
+   return INVALID_SOCKET;
+ }
+ 
+@@ -3084,6 +3111,12 @@ inline void set_nonblocking(socket_t sock, bool nonblocking) {
+   auto flags = fcntl(sock, F_GETFL, 0);
+   fcntl(sock, F_SETFL,
+         nonblocking ? (flags | O_NONBLOCK) : (flags & (~O_NONBLOCK)));
++#ifdef __PROSPERO__
++  // PS5: the console takes O_NONBLOCK and leaves the socket blocking; its own SO_NBIO is what
++  // makes one non-blocking (as Azahar's Artic Base client does), so a connect can time out
++  int nbio = nonblocking ? 1 : 0;
++  setsockopt(sock, SOL_SOCKET, 0x1200 /* SO_NBIO */, &nbio, sizeof(nbio));
++#endif
+ #endif
+ }
+ 
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index 411f529..56e2651 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -29,6 +29,21 @@
+ #include "core/hle/service/http/http_c.h"
+ #include "core/hw/aes/key.h"
+ 
++#ifdef __PROSPERO__
++#include <arpa/inet.h>
++#include <netinet/in.h>
++
++// The PS5's network library, as the port's own downloads use it (app/updates.cpp)
++extern "C" {
++int sceNetPoolCreate(const char* name, int size, int flags);
++int sceNetPoolDestroy(int pool);
++int sceNetResolverCreate(const char* name, int pool, int flags);
++int sceNetResolverStartNtoa(int resolver, const char* host, uint32_t* address, int timeoutUs,
++                            int retries, int flags);
++int sceNetResolverDestroy(int resolver);
++}
++#endif
++
+ SERIALIZE_EXPORT_IMPL(Service::HTTP::HTTP_C)
+ SERIALIZE_EXPORT_IMPL(Service::HTTP::SessionData)
+ 
+@@ -476,11 +491,50 @@ void Context::MakeRequest() {
+     }
+ }
+ 
++#ifdef __PROSPERO__
++// getaddrinfo finds nothing on the console, and httplib's connect failed before it began, with the
++// -1 the request starts with (Artic Setup's system update): the host's address from the PS5's
++// resolver instead, for httplib to connect to. TLS and the Host header keep the host's name.
++// Nothing for a numeric address, or a host the resolver does not find either
++template <typename Client>
++static void UsePS5Resolver(Client& client, const std::string& host) {
++    in_addr numeric{};
++    if (host.empty() || inet_pton(AF_INET, host.c_str(), &numeric) == 1) {
++        return;
++    }
++    const int pool = sceNetPoolCreate("azahar-http", 16 * 1024, 0);
++    if (pool < 0) {
++        LOG_ERROR(Service_HTTP, "{}: no resolver pool ({:#x})", host, static_cast<u32>(pool));
++        return;
++    }
++    u32 address = 0;
++    const int resolver = sceNetResolverCreate("azahar-http", pool, 0);
++    const int result =
++        resolver >= 0 ? sceNetResolverStartNtoa(resolver, host.c_str(), &address, 0, 0, 0) : resolver;
++    if (resolver >= 0) {
++        sceNetResolverDestroy(resolver);
++    }
++    sceNetPoolDestroy(pool);
++    if (result < 0 || address == 0) {
++        LOG_ERROR(Service_HTTP, "{}: the PS5's resolver found no address ({:#x})", host,
++                  static_cast<u32>(result));
++        return;
++    }
++    char text[INET_ADDRSTRLEN] = {};
++    inet_ntop(AF_INET, &address, text, sizeof(text));
++    LOG_INFO(Service_HTTP, "{} is {}, from the PS5's resolver", host, text);
++    client.set_hostname_addr_map({{host, text}});
++}
++#endif
++
+ void Context::MakeRequestNonSSL(httplib::Request& request, const Common::URLInfo& url_info,
+                                 std::vector<Context::RequestHeader>& pending_headers) {
+     httplib::Error error{-1};
+     std::unique_ptr<httplib::Client> client =
+         std::make_unique<httplib::Client>(url_info.host, url_info.port);
++#ifdef __PROSPERO__
++    UsePS5Resolver(*client, url_info.host);
++#endif
+ 
+     client->set_header_writer(
+         [this, &pending_headers](httplib::Stream& strm, httplib::Headers& httplib_headers) {
+@@ -574,6 +628,9 @@ void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& u
+     // https://www.3dbrew.org/wiki/SSL_Services#SSLOpt
+     // Hack: Since for now RootCerts are not implemented we set the VerifyMode to None.
+     client->enable_server_certificate_verification(false);
++#ifdef __PROSPERO__
++    UsePS5Resolver(*client, url_info.host);
++#endif
+ 
+     client->set_header_writer(
+         [this, &pending_headers](httplib::Stream& strm, httplib::Headers& httplib_headers) {

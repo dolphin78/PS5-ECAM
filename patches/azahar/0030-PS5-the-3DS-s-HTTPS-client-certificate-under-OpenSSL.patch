@@ -1,0 +1,73 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps5cemu <ps5cemu@localhost>
+Date: Wed, 21 Oct 2026 18:40:57 -0400
+Subject: [PATCH] PS5: the 3DS's HTTPS client certificate under OpenSSL 3's
+ security level 0
+
+The port links OpenSSL 3 (USE_SYSTEM_OPENSSL), where Azahar bundles
+LibreSSL, which has no security levels: OpenSSL's default level can
+refuse an older certificate in SSL_CTX_use_certificate, and httplib's
+SSLClient is then left with no context, every request failing before it
+connects. The client is made without the certificate, its context's
+level set to 0, and the certificate set then; one still refused is
+logged with OpenSSL's reasons, as is a client with no context.
+
+Artic Setup's system update failed for want of an address (the next
+patch), not for this, with this in place: it was not seen to refuse the
+3DS's certificate, and is kept so the certificate is taken as under
+LibreSSL.
+---
+ src/core/hle/service/http/http_c.cpp | 33 ++++++++++++++++++++++++++++
+ 1 file changed, 33 insertions(+)
+
+diff --git a/src/core/hle/service/http/http_c.cpp b/src/core/hle/service/http/http_c.cpp
+index d64562e..411f529 100644
+--- a/src/core/hle/service/http/http_c.cpp
++++ b/src/core/hle/service/http/http_c.cpp
+@@ -529,6 +529,38 @@ void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& u
+     }
+ 
+     std::unique_ptr<httplib::SSLClient> client;
++#ifdef __PROSPERO__
++    // The port links OpenSSL 3 (USE_SYSTEM_OPENSSL), not the LibreSSL Azahar bundles: its default
++    // security level can refuse an older client certificate, which leaves the client with no
++    // context and every request failing before it connects. The certificate is set after the
++    // context's level is lowered to 0, as LibreSSL has none; the server's certificate is not
++    // verified either way (below)
++    client = std::make_unique<httplib::SSLClient>(url_info.host, url_info.port);
++    if (SSL_CTX* ctx = client->ssl_context()) {
++        SSL_CTX_set_security_level(ctx, 0);
++        if (cert_data && key_data) {
++            cert = d2i_X509(nullptr, &cert_data, cert_size);
++            key = d2i_PrivateKey(EVP_PKEY_RSA, nullptr, &key_data, key_size);
++            if (!cert || !key || SSL_CTX_use_certificate(ctx, cert) != 1 ||
++                SSL_CTX_use_PrivateKey(ctx, key) != 1) {
++                std::string reasons;
++                while (const unsigned long code = ERR_get_error()) {
++                    std::array<char, 256> reason{};
++                    ERR_error_string_n(code, reason.data(), reason.size());
++                    reasons += fmt::format("{}{}", reasons.empty() ? "" : "; ", reason.data());
++                }
++                LOG_ERROR(Service_HTTP, "Client certificate refused ({}{}): {}",
++                          cert ? "" : "no certificate decoded ", key ? "" : "no key decoded",
++                          reasons.empty() ? "no OpenSSL error" : reasons);
++                state = RequestState::Completed;
++                FinishTransfer();
++                return;
++            }
++        }
++    } else {
++        LOG_ERROR(Service_HTTP, "No SSL context: OpenSSL error {:#x}", ERR_get_error());
++    }
++#else
+     if (cert_data && key_data) {
+         cert = d2i_X509(nullptr, &cert_data, cert_size);
+         key = d2i_PrivateKey(EVP_PKEY_RSA, nullptr, &key_data, key_size);
+@@ -536,6 +568,7 @@ void Context::MakeRequestSSL(httplib::Request& request, const Common::URLInfo& u
+     } else {
+         client = std::make_unique<httplib::SSLClient>(url_info.host, url_info.port);
+     }
++#endif
+ 
+     // TODO(B3N30): Check for SSLOptions-Bits and set the verify method accordingly
+     // https://www.3dbrew.org/wiki/SSL_Services#SSLOpt

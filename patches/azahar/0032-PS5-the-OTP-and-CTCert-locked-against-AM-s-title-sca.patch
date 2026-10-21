@@ -1,0 +1,68 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ps5cemu <ps5cemu@localhost>
+Date: Wed, 21 Oct 2026 18:40:57 -0400
+Subject: [PATCH] PS5: the OTP and CTCert locked against AM's title scan
+
+A New 3DS's Artic Setup after an Old 3DS's crashed as it began, reading
+a null pointer in HW::ECC::CreateECCPublicKey: AM scans the installed
+titles on a thread of its own (std::async), and the Old 3DS's setup had
+installed titles encrypted with the console's unique key, which the
+scan opens with the CTCert's public key, while Artic Setup wrote the
+console's data and invalidated the OTP and CTCert on the main thread.
+BuildECC sets the certificate's signature type, which IsValid reads,
+before its public key, so the scan found a valid certificate with no
+key. LoadOTP, InvalidateSecureData and GetUniqueCryptoFileKeyIV take a
+lock (recursive: the last loads the OTP).
+---
+ src/core/hw/unique_data.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/core/hw/unique_data.cpp b/src/core/hw/unique_data.cpp
+index 8106505..04a8cca 100644
+--- a/src/core/hw/unique_data.cpp
++++ b/src/core/hw/unique_data.cpp
+@@ -2,6 +2,7 @@
+ // Licensed under GPLv2 or any later version
+ // Refer to the license.txt file included.
+ 
++#include <mutex>
+ #include <cryptopp/sha.h>
+ #include "common/common_paths.h"
+ #include "common/file_derived.h"
+@@ -26,6 +27,12 @@ static FileSys::OTP otp;
+ static FileSys::Certificate ct_cert;
+ static MovableSedFull movable;
+ static bool movable_signature_valid = false;
++// The OTP and the CTCert built from it, used from AM's title scan (its own thread, std::async) while
++// Artic Setup writes the console's data and invalidates them (artic.cpp): a scan that found the
++// CTCert half-built (BuildECC sets its signature type, which IsValid reads, before its public key)
++// read the key from a null pointer, a New 3DS's setup over an Old 3DS's installed titles crashing
++// as it began. Recursive: GetUniqueCryptoFileKeyIV loads the OTP.
++static std::recursive_mutex otp_mutex;
+ 
+ bool SecureInfoA::VerifySignature() const {
+     auto sec_info_slot = HW::RSA::GetSecureInfoSlot();
+@@ -141,6 +148,7 @@ SecureDataLoadStatus LoadLocalFriendCodeSeedB() {
+ }
+ 
+ SecureDataLoadStatus LoadOTP() {
++    std::scoped_lock lock(otp_mutex);
+     if (otp.Valid()) {
+         return SecureDataLoadStatus::Loaded;
+     }
+@@ -277,6 +285,7 @@ MovableSedFull& GetMovableSed() {
+     return movable;
+ }
+ void InvalidateSecureData() {
++    std::scoped_lock lock(otp_mutex);
+     secure_info_a.Invalidate();
+     local_friend_code_seed_b.Invalidate();
+     otp.Invalidate();
+@@ -286,6 +295,7 @@ void InvalidateSecureData() {
+ 
+ static bool GetUniqueCryptoFileKeyIV(std::vector<u8>& out_key, std::vector<u8>& out_iv,
+                                      UniqueCryptoFileID id) {
++    std::scoped_lock lock(otp_mutex);
+ 
+     LoadOTP();
+ 
