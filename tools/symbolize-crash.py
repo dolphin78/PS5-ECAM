@@ -3,6 +3,7 @@
 """A crash report from the boot log, in function names and source lines.
 
     symbolize-crash.py ELF LOG [LOG...]
+    symbolize-crash.py ELF LOG --ps5 RIP [BACKTRACE...]
 
 ELF is the unstripped build/cemu/ps5cemu.elf of the build that crashed (`make release` keeps each
 release's as dist/ps5cemu-vVERSION.elf); LOG is a boot log (logs/boot.log, or a report's attached
@@ -16,6 +17,10 @@ The eboot is not loaded at the ELF's addresses: the report gives its crash handl
 load offset is that minus the handler's address in the ELF (Cemu's handlerDumpingSignal, or the
 port's own handler in port/ps5/crash.cpp when Cemu did not run). Needs llvm-nm-18 and
 llvm-symbolizer-18 (or the unversioned ones).
+
+With --ps5, the addresses are the PS5's own crash report's (its RIP and backtrace lines), for a crash
+the app's handler never saw and the boot log has no report of: the eboot is placed from the handler's
+address the boot log's start gives ("crash reports: ... (handler at 0x...)"), the last one in LOG.
 """
 
 import re
@@ -178,10 +183,37 @@ def show_hang(elf, handlers, dump, number):
             print(f"      {describe(runtime)}")
 
 
+def show_ps5(elf, handlers, lines, addresses):
+    """The PS5's own report's addresses, placed from the handler's address at the session's start."""
+    started = [m for line in lines for m in [re.search(r"crash reports: .*\(handler at (0x[0-9a-f]+)\)", line)] if m]
+    if not started or "port" not in handlers:
+        sys.exit("no \"crash reports: ... (handler at 0x...)\" line in the log (a build before it), or no handler in the ELF")
+    offset = int(started[-1][1], 16) - handlers["port"]
+    print(f"=== the PS5's report: the port's handler at {started[-1][1]}, the eboot loaded {offset:#x} above the ELF's addresses")
+    looked_up = symbolize(elf, [a - offset for a in addresses if a >= offset])
+    for name, runtime in zip(["RIP"] + [f"backtrace[{i}]" for i in range(len(addresses) - 1)], addresses):
+        found = looked_up.get(runtime - offset)
+        if not found:
+            print(f"  {name} {runtime:#x}: not in the eboot's code (recompiled code, or a system library)")
+            continue
+        (function, location), *inlined = found
+        print(f"  {name} {runtime:#x} ({runtime - offset:#x}): {function}  [{location}]")
+        for function, location in inlined:
+            print(f"      inlined into {function}  [{location}]")
+
+
 def main():
     if len(sys.argv) < 3:
         sys.exit(__doc__)
-    elf, logs = sys.argv[1], sys.argv[2:]
+    arguments = sys.argv[1:]
+    ps5 = []
+    if "--ps5" in arguments:
+        at = arguments.index("--ps5")
+        ps5 = [int(a, 16) for a in arguments[at + 1:]]
+        arguments = arguments[:at]
+        if not ps5:
+            sys.exit(__doc__)
+    elf, logs = arguments[0], arguments[1:]
     handlers = handler_addresses(elf)
     lines = []
     for log in logs:
@@ -190,6 +222,9 @@ def main():
         else:
             with open(log, errors="replace") as file:
                 lines += file.read().splitlines()
+    if ps5:
+        show_ps5(elf, handlers, lines, ps5)
+        return
     found = list(reports(lines))
     for number, report in enumerate(found, 1):
         show(elf, handlers, report, number)

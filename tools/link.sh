@@ -74,6 +74,13 @@ if [[ -f $radv_archive && -f $radv_sdk/target/lib/libps5platform.a ]]; then
     # read around every submission and on every turn of its GPU waits; port/ps5/driver_clock.cpp
     # answers it from the TSC instead
     radv_link_flags+=(--wrap=os_time_get_nano)
+    # fmt's prints to a FILE, which write into the FILE's own buffer through a layout the console's
+    # stderr does not hold: port/ps5/crash.cpp's format apart, and send stderr's to the boot log
+    for name in _ZN3fmt3v126vprintEP7__sFILENS0_17basic_string_viewIcEENS0_17basic_format_argsINS0_7contextEEE \
+        _ZN3fmt3v1215vprint_bufferedEP7__sFILENS0_17basic_string_viewIcEENS0_17basic_format_argsINS0_7contextEEE \
+        _ZN3fmt3v128vprintlnEP7__sFILENS0_17basic_string_viewIcEENS0_17basic_format_argsINS0_7contextEEE; do
+        radv_link_flags+=("--wrap=$name")
+    done
     # access and the directory calls are bound to the platform layer's with --defsym, which a --wrap
     # cannot come before: they are bound to port/ps5/netfs_files.cpp's instead, which answers /net
     # paths and calls the platform's for every other (kept in the link by name)

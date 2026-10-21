@@ -8,8 +8,11 @@
 #include <ucontext.h>
 #include <unistd.h>
 
+#include <fmt/format.h>
+
 #include <algorithm>
 #include <cstdint>
+#include <cstdio>
 #include <string_view>
 
 // The boot log, from a signal handler: write(2), no lock (log.cpp)
@@ -97,6 +100,61 @@ namespace ps5crash
 		action.sa_sigaction = Handler;
 		for (int sig : {SIGABRT, SIGBUS, SIGFPE, SIGILL, SIGSEGV, SIGSYS, SIGTRAP})
 			sigaction(sig, &action, nullptr);
-		ps5log::Line("[main] crash reports: the app's own handler, until an emulator that has one starts");
+		// with its address, where the eboot is: the PS5's own report of a crash the handler never saw
+		// (its RIP and backtrace) is placed from it (tools/symbolize-crash.py --ps5)
+		ps5log::Line("[main] crash reports: the app's own handler, until an emulator that has one starts (handler at {:#x})",
+			reinterpret_cast<uintptr_t>(&Handler));
 	}
+}
+
+// fmt's print to a FILE (fmt::print(stderr, ...)): fmt 12 writes straight into the FILE's buffer
+// through the BSD layout the SDK's headers give it (_p, _w), which the console's stderr does not
+// hold, and faulted. dynarmic's fault handler prints so before it passes a fault on, as mcl's failed
+// assertions do: the fault became a second one in fmt, and no [crash] report was written.
+// tools/link.sh wraps fmt's three FILE prints with these: stderr's and stdout's text goes to the boot
+// log through the crash report's writer (write(2), no lock), every other FILE's through fwrite.
+namespace
+{
+	void PrintToFile(FILE* file, fmt::string_view format, fmt::format_args args, bool newLine)
+	{
+		fmt::memory_buffer text;
+		fmt::vformat_to(fmt::appender(text), format, args);
+		if (newLine)
+			text.push_back('\n');
+		if (file != stderr && file != stdout)
+		{
+			std::fwrite(text.data(), 1, text.size(), file);
+			return;
+		}
+		// one boot log line for each line printed
+		std::string_view rest(text.data(), text.size());
+		while (!rest.empty())
+		{
+			const size_t end = rest.find('\n');
+			const std::string_view line = rest.substr(0, end);
+			if (!line.empty())
+				PS5Cemu_CrashLine(line, true);
+			if (end == std::string_view::npos)
+				break;
+			rest.remove_prefix(end + 1);
+		}
+	}
+}
+
+extern "C" void __wrap__ZN3fmt3v126vprintEP7__sFILENS0_17basic_string_viewIcEENS0_17basic_format_argsINS0_7contextEEE(FILE* file,
+	fmt::string_view format, fmt::format_args args)
+{
+	PrintToFile(file, format, args, false);
+}
+
+extern "C" void __wrap__ZN3fmt3v1215vprint_bufferedEP7__sFILENS0_17basic_string_viewIcEENS0_17basic_format_argsINS0_7contextEEE(
+	FILE* file, fmt::string_view format, fmt::format_args args)
+{
+	PrintToFile(file, format, args, false);
+}
+
+extern "C" void __wrap__ZN3fmt3v128vprintlnEP7__sFILENS0_17basic_string_viewIcEENS0_17basic_format_argsINS0_7contextEEE(FILE* file,
+	fmt::string_view format, fmt::format_args args)
+{
+	PrintToFile(file, format, args, true);
 }
